@@ -55,7 +55,46 @@ public final class PacketTap {
             Object buf = unpooled.getMethod("buffer").invoke(null);
             packet.getClass().getMethod("serialize", bbCls).invoke(packet, buf);
             byte[] payload = readable(buf, bbCls);
-            record("S2C", id, packet.getClass().getSimpleName(), payload, packet, null);
+
+            Object decoded = packet;
+            String decodeError = null;
+            String name = packet.getClass().getSimpleName();
+            byte[] decodeBytes = payload;
+            try {
+                Class<?> registryCls = Class.forName("com.hypixel.hytale.protocol.PacketRegistry", false, cl);
+                Method getInfo = registryCls.getMethod("getToClientPacketById", int.class);
+                Object info = getInfo.invoke(null, id);
+                if (info != null) {
+                    name = String.valueOf(info.getClass().getMethod("name").invoke(info));
+                    boolean compressed = false;
+                    try { compressed = (boolean) info.getClass().getMethod("compressed").invoke(info); } catch (Throwable ignored) {}
+                    if (compressed && payload.length > 0) {
+                        try {
+                            Class<?> zstd = Class.forName("com.github.luben.zstd.Zstd", false, cl);
+                            Method getSize = zstd.getMethod("getFrameContentSize", byte[].class);
+                            long size = ((Number) getSize.invoke(null, (Object) payload)).longValue();
+                            if (size > 0 && size <= MAX_DECOMPRESSED) {
+                                Method decomp = zstd.getMethod("decompress", byte[].class, int.class);
+                                decodeBytes = (byte[]) decomp.invoke(null, payload, (int) size);
+                            }
+                        } catch (Throwable t) {
+                            decodeError = "zstd: " + t.getMessage();
+                        }
+                    }
+                    if (decodeError == null) {
+                        Object copy = unpooled.getMethod("wrappedBuffer", byte[].class).invoke(null, (Object) decodeBytes);
+                        Object de = info.getClass().getMethod("deserialize").invoke(info);
+                        Class<?> dfCls = Class.forName("com.hypixel.hytale.protocol.PacketRegistry$DeserializeFunc", false, cl);
+                        Method m = dfCls.getMethod("deserialize", Object.class, int.class);
+                        decoded = m.invoke(de, copy, Integer.valueOf(0));
+                    }
+                }
+            } catch (Throwable t) {
+                Throwable cause = t.getCause() != null ? t.getCause() : t;
+                decodeError = cause.getClass().getSimpleName() + ": " + cause.getMessage();
+            }
+
+            record("S2C", id, name, payload, decodeError == null ? decoded : null, decodeError);
         } catch (Throwable t) {
             // never break the server
         }
@@ -150,11 +189,6 @@ public final class PacketTap {
         json.append(",\"id\":").append(id);
         json.append(",\"name\":\"").append(esc(name)).append('"');
         json.append(",\"bytes\":").append(payload.length);
-        json.append(",\"payload_hex\":\"");
-        for (byte b : payload) {
-            json.append(HEX[(b >> 4) & 0xf]).append(HEX[b & 0xf]);
-        }
-        json.append('"');
         if (obj != null) {
             try {
                 StringBuilder body = new StringBuilder(2048);
@@ -204,9 +238,7 @@ public final class PacketTap {
         if (c.isArray()) {
             if (c.getComponentType() == byte.class) {
                 byte[] b = (byte[]) o;
-                sb.append("{\"$bytes\":").append(b.length).append(",\"hex\":\"");
-                for (byte x : b) { sb.append(HEX[(x >> 4) & 0xf]).append(HEX[x & 0xf]); }
-                sb.append("\"}");
+                sb.append("{\"$bytes\":").append(b.length).append("}");
                 return;
             }
             if (depth >= MAX_DEPTH) { sb.append("\"<max-depth>\""); return; }
